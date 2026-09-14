@@ -1,0 +1,95 @@
+name: Sync fork with upstream
+
+# Keeps this fork's long-lived branches in step with the upstream repository
+# (ROCm/rocm-libraries) it was forked from.
+#
+# HOW IT WORKS
+#   The job calls GitHub's "merge-upstream" REST endpoint — the same operation
+#   as the "Sync fork" button in the web UI. For each branch it either
+#   fast-forwards (when this fork has no commits of its own) or creates a merge
+#   commit (when it does, e.g. because THIS workflow file only exists here).
+#   Nothing is cloned, so the ~9 GB tree never touches the runner.
+#
+#   A merge conflict makes the API return HTTP 409 and the job fails loudly so
+#   the conflict can be resolved by hand. The job never force-pushes.
+#
+# NOTES
+#   • GitHub disables scheduled workflows on forks by default. Enable this one
+#     once under the Actions tab, and re-enable it if the repo goes 60 days
+#     without a commit (GitHub pauses cron workflows on inactive repos).
+#   • Commits produced with GITHUB_TOKEN do not trigger other workflows, so a
+#     sync does NOT kick off upstream's CI (TheRock CI, pre-commit, …) here.
+#   • Scheduled runs always use the workflow file from the default branch.
+
+on:
+  schedule:
+    # Nightly at 03:17 UTC (off the hour to avoid the top-of-hour rush).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: >-
+          Space-separated list of branches to sync (overrides the default list).
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into fork branches
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Sync branches from upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # Default list of branches to keep in sync. Add more here
+          # (space-separated) as needed, e.g. "develop release/therock-7.1".
+          DEFAULT_BRANCHES: develop
+          INPUT_BRANCHES: ${{ inputs.branches }}
+        run: |
+          set -euo pipefail
+
+          branches="${INPUT_BRANCHES:-$DEFAULT_BRANCHES}"
+
+          # Only meaningful on a fork. If this file ever lands in a non-fork
+          # (e.g. upstream itself via a PR) there is nothing to sync from.
+          upstream="$(gh api "/repos/${GH_REPO}" --jq '.parent.full_name // empty')"
+          if [[ -z "${upstream}" ]]; then
+            echo "::notice::${GH_REPO} is not a fork — nothing to sync."
+            exit 0
+          fi
+          echo "Upstream repository: ${upstream}"
+
+          failed=0
+          for branch in ${branches}; do
+            echo "::group::Syncing '${branch}' from ${upstream}"
+            # merge-upstream returns:
+            #   200 -> synced ("merge_type": fast-forward | merge | none)
+            #   409 -> merge conflict
+            #   422 -> branch missing on the fork, or repo is not a fork
+            if response="$(gh api --method POST \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${GH_REPO}/merge-upstream" \
+                  -f branch="${branch}" 2>&1)"; then
+              merge_type="$(jq -r '.merge_type // "unknown"' <<<"${response}")"
+              message="$(jq -r '.message // ""' <<<"${response}")"
+              echo "${message} (merge_type=${merge_type})"
+              echo "- \`${branch}\`: ${merge_type} — ${message}" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "::error title=Sync failed for '${branch}'::${response}"
+              echo "- \`${branch}\`: ❌ FAILED — ${response}" >> "${GITHUB_STEP_SUMMARY}"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+
+          exit "${failed}"
